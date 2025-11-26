@@ -1,6 +1,6 @@
 # ============================================================
-# app.py — Indian Stocks + Options AI Telegram Bot (Webhook Mode)
-# Gemini 2.5 Flash + Webhook + JobQueue + NSE Optimizations
+# app.py — Indian Stocks AI Bot using OpenRouter (Llama 3.1 70B)
+# No quota problems, fast, stable, webhook
 # ============================================================
 
 import os
@@ -13,8 +13,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from google import genai
-from google.genai import types as genai_types
+from openai import OpenAI
 
 from telegram import Update
 from telegram.ext import (
@@ -26,34 +25,34 @@ from telegram.ext import (
 )
 
 # ============================================================
-# ENVIRONMENT VARIABLES
+# ENVIRONMENT
 # ============================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-render-service.onrender.com
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # your Render URL
 PORT = int(os.getenv("PORT", "10000"))
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY missing")
+if not OPENROUTER_API_KEY:
+    raise RuntimeError("OPENROUTER_API_KEY missing")
 
 if not WEBHOOK_URL:
     raise RuntimeError("WEBHOOK_URL missing")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = OpenAI(
+    api_key=OPENROUTER_API_KEY,
+    base_url="https://openrouter.ai/api/v1",
+)
 
 # ============================================================
 # LOGGING
 # ============================================================
 
-logging.basicConfig(
-    format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("stocks-ai-webhook")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("stocks-openrouter")
 
 # ============================================================
 # SYMBOL MAPS
@@ -72,10 +71,8 @@ STOCK_SYMBOL_MAP = {
     "ITC": "ITC.NS",
     "LT": "LT.NS",
     "HINDUNILVR": "HINDUNILVR.NS",
-
     "NIFTY": "^NSEI",
     "NIFTY50": "^NSEI",
-    "NIFTYBANK": "^NSEBANK",
     "BANKNIFTY": "^NSEBANK",
 }
 
@@ -98,85 +95,50 @@ FUTURES_SCAN_LIST = [
 # ============================================================
 
 TIMEFRAME_YF_MAP = {
-    "5m": ("5m", "5d"),
     "15m": ("15m", "20d"),
     "1h": ("60m", "60d"),
-    "2h": ("60m", "60d"),
     "4h": ("60m", "60d"),
-    "6h": ("60m", "60d"),
-    "12h": ("60m", "60d"),
     "1d": ("1d", "2y"),
-    "daily": ("1d", "2y"),
-    "1w": ("1wk", "5y"),
-    "weekly": ("1wk", "5y"),
 }
 
-DEFAULT_MULTI_TF = ["5m", "15m", "1h", "4h", "1d", "1w"]
+DEFAULT_MULTI_TF = ["15m", "1h", "4h", "1d"]
 
 # ============================================================
 # UTILITIES
 # ============================================================
 
-def map_symbol(symbol_raw: str) -> str:
-    s = symbol_raw.strip().upper()
+def map_symbol(s: str) -> str:
+    s = s.strip().upper()
     return STOCK_SYMBOL_MAP.get(s, f"{s}.NS")
-
 
 # ============================================================
 # FETCH OHLCV (WITH MULTIINDEX FIX)
 # ============================================================
 
-def fetch_ohlcv(symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
+def fetch_ohlcv(symbol, timeframe):
     if timeframe not in TIMEFRAME_YF_MAP:
         return None
 
     interval, period = TIMEFRAME_YF_MAP[timeframe]
 
-    try:
-        df = yf.download(symbol, interval=interval, period=period, progress=False)
-    except Exception as e:
-        logger.error(f"yfinance error for {symbol}: {e}")
-        return None
-
+    df = yf.download(symbol, interval=interval, period=period, progress=False)
     if df is None or df.empty:
         return None
 
-    # 🔥 FIX 1: Flatten MultiIndex columns immediately
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [str(c[0]) for c in df.columns]
+        df.columns = [c[0] for c in df.columns]
 
-    # Standard rename
-    df = df.rename(
-        columns={
-            "Open": "open",
-            "High": "high",
-            "Low": "low",
-            "Close": "close",
-            "Adj Close": "adj_close",
-            "Volume": "volume",
-        }
-    ).dropna()
+    df = df.rename(columns={
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Adj Close": "adj_close",
+        "Volume": "volume",
+    }).dropna()
 
-    # 🔥 FIX 2: Ensure volume is numeric everywhere
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
     df = df.dropna(subset=["volume"])
-
-    # Higher TF resampling
-    if timeframe in ["2h", "4h", "6h", "12h"]:
-        rule = {"2h": "2H", "4h": "4H", "6h": "6H", "12h": "12H"}[timeframe]
-        df = (
-            df.resample(rule)
-            .agg(
-                {
-                    "open": "first",
-                    "high": "max",
-                    "low": "min",
-                    "close": "last",
-                    "volume": "sum",
-                }
-            )
-            .dropna()
-        )
 
     return df
 
@@ -185,527 +147,183 @@ def fetch_ohlcv(symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
 # INDICATORS (RSI FIX)
 # ============================================================
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def add_indicators(df):
     df = df.copy()
-
-    df["ema_20"] = df["close"].ewm(span=20).mean()
     df["ema_50"] = df["close"].ewm(span=50).mean()
     df["ema_200"] = df["close"].ewm(span=200).mean()
 
-    # 🔥 RSI FIX — ensure 1D arrays
     delta = df["close"].diff().to_numpy().ravel()
-    gain = np.where(delta > 0, delta, 0.0).ravel()
-    loss = np.where(delta < 0, -delta, 0.0).ravel()
+    gain = np.where(delta > 0, delta, 0).ravel()
+    loss = np.where(delta < 0, -delta, 0).ravel()
 
     roll_up = pd.Series(gain).rolling(14).mean()
     roll_down = pd.Series(loss).rolling(14).mean()
     rs = roll_up / (roll_down + 1e-9)
-    df["rsi_14"] = (100 - (100 / (1 + rs))).values
-
-    # Typical Price
-    tp = (df["high"] + df["low"] + df["close"]) / 3.0
-    df["tp"] = tp
-    df["vwap"] = (tp * df["volume"]).cumsum() / (df["volume"].cumsum() + 1e-9)
+    df["rsi"] = (100 - (100 / (1 + rs))).values
 
     return df
 
 
 # ============================================================
-# FIXED-RANGE VOLUME PROFILE (FULLY HARDENED)
+# OPENROUTER MODEL CALL
 # ============================================================
 
-def compute_volume_profile(df: pd.DataFrame, lookback=120, bins=20):
-    if len(df) < 10:
-        return None
-
-    sub = df.tail(lookback).copy()
-
-    # 🔥 HARDEN: ensure numeric
-    sub["tp"] = pd.to_numeric(sub["tp"], errors="coerce")
-    sub["volume"] = pd.to_numeric(sub["volume"], errors="coerce")
-    sub = sub.dropna(subset=["tp", "volume"])
-
-    if sub.empty:
-        return None
-
-    low, high = float(sub["low"].min()), float(sub["high"].max())
-    if high <= low:
-        return None
-
-    tp = sub["tp"].to_numpy(dtype=float)
-    vol = sub["volume"].to_numpy(dtype=float)
-
-    edges = np.linspace(low, high, bins + 1)
-    idxs = np.digitize(tp, edges) - 1
-
-    vp = {}
-
-    # 🔥 NEVER use float(v). v is already numeric.
-    for idx, v in zip(idxs, vol):
-        if 0 <= idx < bins:
-            vp[idx] = vp.get(idx, 0.0) + v
-
-    if not vp:
-        return None
-
-    top = sorted(vp.items(), key=lambda x: x[1], reverse=True)[:3]
-
-    nodes = []
-    for i, _ in top:
-        mid = (edges[i] + edges[i + 1]) / 2.0
-        nodes.append(round(float(mid), 2))
-
-    return {
-        "low": round(low, 2),
-        "high": round(high, 2),
-        "nodes": nodes,
-    }
-
-
-# ============================================================
-# TREND + REVERSAL
-# ============================================================
-
-def detect_reversal(df: pd.DataFrame) -> Optional[str]:
-    if len(df) < 2:
-        return None
-
-    prev, last = df.iloc[-2], df.iloc[-1]
-
-    # Bullish engulfing
-    if (
-        prev["close"] < prev["open"]
-        and last["close"] > last["open"]
-        and last["close"] >= prev["open"]
-        and last["open"] <= prev["close"]
-    ):
-        return "bullish_engulfing"
-
-    # Bearish engulfing
-    if (
-        prev["close"] > prev["open"]
-        and last["close"] < last["open"]
-        and last["close"] <= prev["open"]
-        and last["open"] >= prev["close"]
-    ):
-        return "bearish_engulfing"
-
-    return None
-
-
-def trend_label(df: pd.DataFrame) -> str:
-    if len(df) < 20:
-        return "sideways"
-
-    last = df.iloc[-1]
-    price = last["close"]
-    ema20 = last["ema_20"]
-    ema50 = last["ema_50"]
-    ema200 = last["ema_200"]
-
-    slope = (df["close"].iloc[-1] - df["close"].iloc[-20]) / (
-        df["close"].iloc[-20] + 1e-9
-    )
-
-    if price > ema20 > ema50 > ema200 and slope > 0.02:
-        return "strong uptrend"
-    if price < ema20 < ema50 < ema200 and slope < -0.02:
-        return "strong downtrend"
-    if price > ema20 and slope > 0:
-        return "mild uptrend"
-    if price < ema20 and slope < 0:
-        return "mild downtrend"
-
-    return "sideways"
-
-
-# ============================================================
-# MULTI-TF SUMMARY
-# ============================================================
-
-def build_multi_tf_summary(symbol, yf_symbol, timeframe=None):
-    tfs = [timeframe] if timeframe else DEFAULT_MULTI_TF
-    results = {}
-    err = ""
-
-    for tf in tfs:
-        df = fetch_ohlcv(yf_symbol, tf)
-
-        if df is None or df.empty:
-            err += f"Failed to fetch {tf} timeframe\n"
-            continue
-
-        df = add_indicators(df)
-        last = df.iloc[-1]
-
-        vp = compute_volume_profile(df)
-
-        results[tf] = {
-            "price": float(last["close"]),
-            "ema20": float(last["ema_20"]),
-            "ema50": float(last["ema_50"]),
-            "ema200": float(last["ema_200"]),
-            "rsi": float(last["rsi_14"]),
-            "trend": trend_label(df),
-            "vp": vp,
-        }
-
-    return results, err
-
-
-# ============================================================
-# AUTOSCAN
-# ============================================================
-
-def autoscan_signal(symbol, yf_symbol):
-    df = fetch_ohlcv(yf_symbol, "5m")
-    if df is None or len(df) < 50:
-        return None
-
-    df = add_indicators(df)
-    vp = compute_volume_profile(df, 100, 24)
-    if not vp:
-        return None
-
-    last = df.iloc[-1]
-    price = float(last["close"])
-    rsi = float(last["rsi_14"])
-    trend = trend_label(df)
-    pattern = detect_reversal(df)
-    nodes = vp["nodes"]
-
-    direction = None
-    prob = 0.55
-
-    if "uptrend" in trend:
-        direction = "LONG"
-        prob += 0.15
-        if rsi < 65:
-            prob += 0.05
-
-    elif "downtrend" in trend:
-        direction = "SHORT"
-        prob += 0.15
-        if rsi > 35:
-            prob += 0.05
-
-    else:
-        prob -= 0.05
-
-    if pattern == "bullish_engulfing" and direction != "SHORT":
-        direction = "LONG"
-        prob += 0.15
-
-    if pattern == "bearish_engulfing" and direction != "LONG":
-        direction = "SHORT"
-        prob += 0.15
-
-    if not nodes:
-        return None
-
-    key = min(nodes, key=lambda x: abs(x - price))
-
-    dist = abs(price - key) / price * 100
-    if dist < 0.3:
-        prob += 0.10
-
-    prob = min(max(prob, 0), 0.95)
-
-    if direction == "LONG":
-        sl = key * 0.997
-        risk = price - sl
-        tp = price + 1.9 * risk
-    else:
-        sl = key * 1.003
-        risk = sl - price
-        tp = price - 1.9 * risk
-
-    rr = abs(tp - price) / (abs(price - sl) + 1e-9)
-
-    if prob >= 0.85 and rr >= 1.9:
-        return {
-            "symbol": symbol,
-            "direction": direction,
-            "prob": prob,
-            "entry": round(price, 2),
-            "sl": round(sl, 2),
-            "tp": round(tp, 2),
-            "rr": rr,
-        }
-
-    return None
-
-
-# ============================================================
-# GEMINI STOCK ANALYSIS
-# ============================================================
-
-async def gemini_stock(symbol, yf_symbol, timeframe, data):
-    lines = []
-    for tf, info in data.items():
-        vp = info["vp"]
-        vp_txt = (
-            f"range {vp['low']}–{vp['high']} nodes={vp['nodes']}"
-            if vp
-            else "VP not available"
-        )
-        lines.append(
-            f"- {tf}: price={info['price']}, rsi={info['rsi']:.1f}, trend={info['trend']}, {vp_txt}"
-        )
-
-    block = "\n".join(lines)
-
-    prompt = f"""
-You are an elite Indian stock market analyst.
-
-Symbol: {symbol}
-Yahoo: {yf_symbol}
-Timeframe: {timeframe if timeframe else "multi-timeframe"}
-
-Multi-timeframe data:
-{block}
-
-Give:
-Upside probability:
-Downside probability:
-Flat/choppy probability:
-
-Bias explanation.
-
-If highest >= 75%, give:
-Entry, SL, TP1, TP2, RR.
-
-Final summary (3 lines).
-"""
-
+async def openrouter_chat(prompt):
     try:
-        res = await asyncio.to_thread(
-            client.models.generate_content,
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                max_output_tokens=700,
-                temperature=0.35,
-            ),
+        completion = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="meta-llama/llama-3.1-70b-instruct",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=650,
+            temperature=0.3,
         )
-        return res.text or "Model returned no text."
+        return completion.choices[0].message.content
     except Exception as e:
-        logger.error(f"Gemini stock error: {e}")
-        return "Gemini stock analysis failed."
+        logger.error(f"OpenRouter Error: {e}")
+        return "OpenRouter request failed."
 
 
 # ============================================================
-# GEMINI OPTIONS ANALYSIS
+# STOCK ANALYSIS
 # ============================================================
 
-async def gemini_options(symbol, yf_symbol, strike, last_price):
+async def stock_ai(symbol, yf_symbol, timeframe, info):
+
     prompt = f"""
-You are an NSE options expert.
+Act as a top Indian stock analyst.
 
-Underlying: {symbol}
-Yahoo: {yf_symbol}
-LTP: {last_price}
-Strike requested: {strike}
+Symbol: {symbol} ({yf_symbol})
+Timeframe: {timeframe}
+
+Data:
+Price = {info['price']}
+EMA50 = {info['ema_50']}
+EMA200 = {info['ema_200']}
+RSI = {info['rsi']}
 
 Give:
 - Upside probability %
 - Downside probability %
-- Flat/choppy probability %
-- Bias explanation
+- Flat probability %
+- Explanation (2 lines)
+If highest >= 75%:
+- Entry, SL, TP1, TP2, RR
 
-Then best option setup:
-- Buy/Sell CE/PE
-- Expiry
-- Entry
-- SL
-- TP1 / TP2
-- RR
-
-Short 3–4 line explanation.
+Keep it crisp & powerful.
 """
 
-    try:
-        res = await asyncio.to_thread(
-            client.models.generate_content,
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                max_output_tokens=700,
-                temperature=0.35,
-            ),
-        )
-        return res.text or "Model returned no text."
-    except Exception as e:
-        logger.error(f"Gemini options error: {e}")
-        return "Gemini options analysis failed."
+    return await openrouter_chat(prompt)
 
 
 # ============================================================
-# TELEGRAM COMMAND HANDLERS
+# OPTIONS ANALYSIS
 # ============================================================
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    jq = context.application.job_queue
-    chat_id = update.effective_chat.id
+async def options_ai(symbol, yf_symbol, strike, price):
 
-    old = context.chat_data.get("scan")
-    if old:
-        old.schedule_removal()
+    prompt = f"""
+Act as an NSE Options Expert.
 
-    job = jq.run_repeating(
-        autoscan_job,
-        interval=5 * 60,
-        first=5,
-        data={"chat_id": chat_id, "last": None},
-    )
-    context.chat_data["scan"] = job
+Underlying: {symbol} ({yf_symbol})
+LTP: {price}
+Requested Strike: {strike}
 
-    await update.message.reply_text(
-        "🚀 Auto-scan started (every 5 minutes).\nUse /stop to stop."
-    )
+Give:
+• Upside probability %
+• Downside probability %
+• Flat probability %
+• CE/PE Buy/Sell suggestion
+• Ideal expiry
+• Entry, SL, TP
+• RR
+• 2–3 lines reasoning
+"""
 
-
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    job = context.chat_data.get("scan")
-    if job:
-        job.schedule_removal()
-        context.chat_data["scan"] = None
-        await update.message.reply_text("🛑 Auto-scan stopped.")
-    else:
-        await update.message.reply_text("No autoscan running.")
+    return await openrouter_chat(prompt)
 
 
-async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data
-    chat_id = data["chat_id"]
-    now = dt.datetime.utcnow()
-    last = data.get("last")
+# ============================================================
+# COMMAND HANDLERS
+# ============================================================
 
-    if last and (now - last).total_seconds() < 600:
-        return
+async def cmd_stock(update: Update, context):
+    msg = update.message.text.split()
+    symbol = msg[0][1:].upper()
+    timeframe = msg[1].lower() if len(msg) > 1 else "1h"
 
-    signals = []
-    for s in FUTURES_SCAN_LIST:
-        yf_symbol = map_symbol(s)
-        try:
-            sig = autoscan_signal(s, yf_symbol)
-            if sig:
-                signals.append(sig)
-        except Exception as e:
-            logger.error(e)
+    yf_symbol = map_symbol(symbol)
 
-    if not signals:
-        return
+    await update.message.reply_text("📊 Analysing…")
 
-    data["last"] = now
-    msg = "⚡ Auto-scan signals:\n\n"
+    df = fetch_ohlcv(yf_symbol, timeframe)
+    if df is None:
+        return await update.message.reply_text("Data unavailable.")
 
-    for s in signals:
-        msg += (
-            f"*{s['symbol']}* — {s['direction']}\n"
-            f"Entry `{s['entry']}` | SL `{s['sl']}` | TP `{s['tp']}`\n"
-            f"RR `{s['rr']:.2f}` | Prob `{int(s['prob']*100)}%`\n\n"
-        )
+    df = add_indicators(df)
+    last = df.iloc[-1]
 
-    await context.bot.send_message(chat_id, msg, parse_mode="Markdown")
+    info = {
+        "price": float(last["close"]),
+        "ema_50": float(last["ema_50"]),
+        "ema_200": float(last["ema_200"]),
+        "rsi": float(last["rsi"]),
+    }
+
+    resp = await stock_ai(symbol, yf_symbol, timeframe, info)
+    await update.message.reply_text(resp)
 
 
-async def cmd_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Optionable NSE symbols:\n" + ", ".join(OPTIONABLE_SYMBOLS)
-    )
-
-
-async def cmd_strikeprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_strikeprice(update: Update, context):
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /strikeprice SYMBOL STRIKE")
-        return
+        return await update.message.reply_text("Usage: /strikeprice SYMBOL STRIKE")
 
     symbol = context.args[0].upper()
-
-    try:
-        strike = float(context.args[1])
-    except:
-        await update.message.reply_text("Strike must be a number.")
-        return
+    strike = float(context.args[1])
 
     yf_symbol = map_symbol(symbol)
-
     df = fetch_ohlcv(yf_symbol, "1d")
-    if df is None or df.empty:
-        await update.message.reply_text("Could not fetch underlying price.")
-        return
 
-    last_price = float(df["close"].iloc[-1])
+    if df is None:
+        return await update.message.reply_text("Data unavailable.")
 
-    await update.message.reply_text("🔍 Analysing options…")
+    price = float(df["close"].iloc[-1])
 
-    resp = await gemini_options(symbol, yf_symbol, strike, last_price)
+    await update.message.reply_text("📉 Analysing options…")
+
+    resp = await options_ai(symbol, yf_symbol, strike, price)
     await update.message.reply_text(resp)
 
 
-async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message.text.strip().split()
-    symbol = msg[0][1:].upper()
-
-    timeframe = None
-    if len(msg) > 1:
-        timeframe = msg[1].lower()
-        if timeframe in {"4hr", "4hour"}:
-            timeframe = "4h"
-        if timeframe in {"1day", "day"}:
-            timeframe = "1d"
-        if timeframe in {"1week", "week"}:
-            timeframe = "1w"
-
-    yf_symbol = map_symbol(symbol)
-
-    await update.message.reply_text("📈 Analysing…")
-
-    data, err = build_multi_tf_summary(symbol, yf_symbol, timeframe)
-    if not data:
-        await update.message.reply_text("Failed to fetch data.\n" + err)
-        return
-
-    resp = await gemini_stock(symbol, yf_symbol, timeframe, data)
-    await update.message.reply_text(resp)
+async def cmd_options(update: Update, context):
+    await update.message.reply_text("Optionable NSE symbols:\n" + ", ".join(OPTIONABLE_SYMBOLS))
 
 
 async def cmd_help(update: Update, context):
     await update.message.reply_text(
-        "/start — start autoscan\n"
-        "/stop — stop autoscan\n"
-        "/options — list optionable symbols\n"
-        "/strikeprice SYMBOL STRIKE — options analysis\n"
-        "/dmart or /dmart 4h — stock analysis\n"
+        "/dmart\n"
+        "/dmart 1h\n"
+        "/strikeprice NIFTY50 25900\n"
+        "/options\n"
     )
 
 
 async def error_handler(update, context):
-    logger.error("Exception:", exc_info=context.error)
+    logger.error(context.error)
 
 
 # ============================================================
-# MAIN (WEBHOOK MODE)
+# MAIN WEBHOOK
 # ============================================================
 
 def main():
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .build()
-    )
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("options", cmd_options))
     app.add_handler(CommandHandler("strikeprice", cmd_strikeprice))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_stock))
 
     app.add_error_handler(error_handler)
-
-    logger.info("Starting webhook server…")
 
     app.run_webhook(
         listen="0.0.0.0",
