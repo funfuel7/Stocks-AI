@@ -1,5 +1,5 @@
 python-telegram-bot[webhooks,job-queue]==21.6
-google-genai>=0.5.0
+openai>=1.35.0
 yfinance>=0.2.50
 pandas>=2.2.0
 numpy>=1.26.0
