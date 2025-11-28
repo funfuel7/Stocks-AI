@@ -405,7 +405,7 @@ async def openrouter_chat(prompt: str) -> str:
 
 
 # ============================================================
-# AI: STOCK ANALYSIS (MULTI-TF, PA + INDICATORS + VP)
+# AI: STOCK ANALYSIS
 # ============================================================
 
 async def ai_stock_analysis(symbol: str, yf_symbol: str,
@@ -430,12 +430,10 @@ async def ai_stock_analysis(symbol: str, yf_symbol: str,
     prompt = f"""
 You are a world-class Indian derivatives and price-action trader.
 
-You must analyse ALL the information below and give a SHORT, TRADING-FOCUSED answer.
-
 Symbol: {symbol} ({yf_symbol})
 Timeframe focus: {"single " + timeframe if timeframe else "multi-timeframe (5m..1w)"}
 
-Data per timeframe:
+Multi-timeframe data:
 {block}
 
 Use:
@@ -444,9 +442,8 @@ Use:
 - RSI signal + divergences
 - MACD momentum
 - ATR for volatility
-- fixed-range volume profile nodes as MAJOR levels:
-  treat the VP nodes as demand/supply zones
-- candlestick reversals near VP nodes for extra confidence
+- fixed-range volume profile nodes as MAJOR levels
+- candlestick reversals near VP nodes for confirmation
 
 Return in MAX 8–10 lines:
 
@@ -458,12 +455,12 @@ Return in MAX 8–10 lines:
 
 If highest probability >= 75%:
 5) Trade plan:
-   - Direction:
-   - Entry:
-   - Stoploss (must be at meaningful support/resistance that is not easily hunted)
-   - TP1:
-   - TP2:
-   - Approx RR:
+   - Direction
+   - Entry
+   - Stoploss (meaningful S/R, not random)
+   - TP1
+   - TP2
+   - Approx RR
 
 6) Final summary (1–2 lines only).
 """
@@ -472,47 +469,123 @@ If highest probability >= 75%:
 
 
 # ============================================================
-# AI: OPTIONS ANALYSIS
+# AI: OPTIONS ANALYSIS (SMART, STRIKE OPTIONAL)
 # ============================================================
 
 async def ai_options_analysis(symbol: str, yf_symbol: str,
-                              strike: float, last_price: float) -> str:
+                              strike: Optional[float],
+                              last_price: float) -> str:
+    today = dt.date.today()
+
+    # Prepare a few upcoming Thursdays for the model to choose
+    # (weekly expiries approximation)
+    next_thursdays = []
+    d = today
+    while len(next_thursdays) < 4:
+        if d.weekday() == 3:  # Thursday = 3
+            next_thursdays.append(d)
+        d += dt.timedelta(days=1)
+
+    # Monthly expiry approximation: last Thursday of current or next month
+    # (loose approx, still better than nothing)
+    def last_thursday_of_month(year, month):
+        # start from last day of month and go backwards
+        if month == 12:
+            nxt = dt.date(year + 1, 1, 1)
+        else:
+            nxt = dt.date(year, month + 1, 1)
+        last_day = nxt - dt.timedelta(days=1)
+        d2 = last_day
+        while d2.weekday() != 3:
+            d2 -= dt.timedelta(days=1)
+        return d2
+
+    monthly1 = last_thursday_of_month(today.year, today.month)
+    # if already past, go next month
+    if monthly1 < today:
+        m = today.month + 1
+        y = today.year
+        if m == 13:
+            m = 1
+            y += 1
+        monthly1 = last_thursday_of_month(y, m)
+
+    weekly_list = [d.strftime("%d %b %Y") for d in next_thursdays]
+    monthly_str = monthly1.strftime("%d %b %Y")
+
+    user_strike_info = (
+        f"User provided strike: {strike}" if strike is not None
+        else "User did not provide any strike; you must choose the safest strike."
+    )
+
     prompt = f"""
 You are an expert NSE options trader and risk manager.
 
 Underlying: {symbol} ({yf_symbol})
 Spot price: {last_price}
-Requested strike: {strike}
+{user_strike_info}
 
-Consider:
-- trend on higher TF
-- how far strike is from spot (ITM/ATM/OTM)
-- best risk-managed CE/PE strategy
+Available nearby weekly expiry dates (Thursday):
+{weekly_list}
 
-Return SHORT answer (max 8–10 lines):
+Recommended monthly expiry candidate (approx last Thursday):
+{monthly_str}
 
-1) Upside probability %
-2) Downside probability %
-3) Flat/choppy probability %
+Your job:
+1. First decide the directional bias: bullish / bearish / flat.
+2. Then decide which is LESS RISKY RIGHT NOW:
+   - Buy Call (CE)
+   - Buy Put (PE)
+   - Sell Call (CE)
+   - Sell Put (PE)
 
-4) Suggested options action:
-   - Buy/Sell CE/PE
-   - Recommended strike (can be different from requested)
-   - Recommended expiry (weekly/monthly)
+3. Strike selection:
+   - If user strike is clearly reasonable, you MAY use it.
+   - But you are allowed to override and choose a BETTER strike
+     (ATM or slightly OTM/ITM) if it is safer.
+   - Explain if you override the user strike.
 
-5) Entry, SL, TP (for the underlying or approximate premium)
-6) RR and 2–3 lines risk explanation.
+4. Expiry selection (SMART — option B):
+   - If trend is clean and strong → choose nearest WEEKLY expiry for aggressive directional trades.
+   - If current weekly expiry is too close (very little time left) or market is a bit choppy → choose NEXT weekly expiry.
+   - If market looks slow / range-bound but biased → choose MONTHLY expiry for safer theta/risk.
+   - Always mention the exact date (e.g. 09 Dec 2025) from the provided weekly/monthly list.
+
+Return in MAX 8–10 lines:
+
+1) Upside probability: X %
+2) Downside probability: Y %
+3) Flat/choppy probability: Z %
+
+4) Suggested options action (risk-first):
+   - e.g. "Buy NIFTY50 22200 CE" OR "Sell RELIANCE 2600 PE"
+   - clearly mention CE/PE and whether buy or sell.
+   - use ATM / slightly OTM strikes as appropriate.
+
+5) Expiry:
+   - one of the provided weekly dates OR the monthly date.
+   - say: "Choose weekly expiry on <date>" OR "Choose monthly expiry on <date>"
+
+6) Trade plan (for the underlying OR premium level):
+   - Entry:
+   - Stoploss:
+   - Take profit:
+   - Approx RR:
+
+7) Short explanation (2–3 lines) linking:
+   - price action
+   - volume profile / key support-resistance zone
+   - why buy vs sell is safer in this scenario.
 """
 
     return await openrouter_chat(prompt)
 
 
 # ============================================================
-# AUTOSCAN LOGIC (no LLM, but PA + VP heuristic)
+# AUTOSCAN LOGIC
 # ============================================================
 
 def autoscan_signal(symbol: str, yf_symbol: str) -> Optional[Dict[str, Any]]:
-    """Use 5m + 1h data, volume profile and PA to create high-confidence signal."""
     df_5m = fetch_ohlcv(yf_symbol, "5m")
     df_1h = fetch_ohlcv(yf_symbol, "1h")
     if df_5m is None or df_1h is None or len(df_5m) < 80:
@@ -538,18 +611,14 @@ def autoscan_signal(symbol: str, yf_symbol: str) -> Optional[Dict[str, Any]]:
     if not nodes:
         return None
 
-    # Nearest volume node
     key = min(nodes, key=lambda x: abs(x - price))
     dist = abs(price - key) / price * 100
-
-    # Must be close to VP node (fixed range zone)
-    if dist > 0.4:  # 0.4% away -> ignore
+    if dist > 0.4:
         return None
 
     direction = None
     prob = 0.5
 
-    # Base on 1h trend
     if "uptrend" in trend_1h:
         direction = "LONG"
         prob += 0.2
@@ -557,19 +626,16 @@ def autoscan_signal(symbol: str, yf_symbol: str) -> Optional[Dict[str, Any]]:
         direction = "SHORT"
         prob += 0.2
 
-    # 5m trend minor confirmation
     if direction == "LONG" and "uptrend" in trend_5m:
         prob += 0.1
     if direction == "SHORT" and "downtrend" in trend_5m:
         prob += 0.1
 
-    # RSI zones
     if direction == "LONG" and 35 <= rsi <= 65:
         prob += 0.05
     if direction == "SHORT" and 35 <= rsi <= 65:
         prob += 0.05
 
-    # Reversal candle at VP node
     if pattern in ("bullish_engulfing", "bullish_hammer") and direction != "SHORT":
         direction = "LONG"
         prob += 0.2
@@ -577,16 +643,14 @@ def autoscan_signal(symbol: str, yf_symbol: str) -> Optional[Dict[str, Any]]:
         direction = "SHORT"
         prob += 0.2
 
-    # Sanity check
     if direction is None:
         return None
 
     prob = max(0.0, min(prob, 0.98))
 
-    # Build SL/TP based on VP node & ATR
     atr = float(last_5m["atr_14"] or 0.0)
     if atr <= 0:
-        atr = price * 0.003  # fallback
+        atr = price * 0.003
 
     if direction == "LONG":
         sl = min(key - atr, price - 2 * atr)
@@ -599,7 +663,6 @@ def autoscan_signal(symbol: str, yf_symbol: str) -> Optional[Dict[str, Any]]:
 
     rr = abs(tp - price) / (abs(price - sl) + 1e-9)
 
-    # Medium-frequency filter: prob >= 0.85 and RR >= 1.9
     if prob >= 0.85 and rr >= 1.9:
         return {
             "symbol": symbol,
@@ -624,7 +687,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — start autoscan (5m, medium frequency)\n"
         "/stop — stop autoscan\n"
         "/options — list optionable symbols\n"
-        "/strikeprice SYMBOL STRIKE — options AI analysis\n"
+        "/strikeprice SYMBOL [STRIKE] — options AI analysis (strike is optional)\n"
         "/dmart or /dmart 4h — multi-TF AI stock analysis\n"
     )
 
@@ -675,7 +738,6 @@ async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
     now = dt.datetime.utcnow()
     last_ts = data.get("last_ts")
 
-    # 10-min cooldown between batches
     if last_ts and (now - last_ts).total_seconds() < 600:
         return
 
@@ -707,16 +769,20 @@ async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_strikeprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /strikeprice SYMBOL STRIKE")
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text("Usage: /strikeprice SYMBOL [STRIKE]")
         return
 
-    symbol = context.args[0].upper()
-    try:
-        strike = float(context.args[1])
-    except ValueError:
-        await update.message.reply_text("Strike must be a number.")
-        return
+    symbol = args[0].upper()
+    strike: Optional[float] = None
+
+    if len(args) >= 2:
+        try:
+            strike = float(args[1])
+        except ValueError:
+            # If user gave bad strike, just ignore and let AI choose
+            strike = None
 
     yf_symbol = map_symbol(symbol)
     df = fetch_ohlcv(yf_symbol, "1d")
@@ -791,4 +857,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
