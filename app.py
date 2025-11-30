@@ -5,6 +5,9 @@
 # - Multi-timeframe analysis: 5m, 15m, 30m, 1h, 2h, 4h, 1d, 3d, 1w
 # - Price-action + indicators + fixed-range volume profile
 # - Autoscan every 5 minutes with 10 min cooldown, medium frequency
+# - /strikeprice with optional strike, risk-first options logic
+# - /options for optionable symbols
+# - /futures for most liquid NSE F&O futures symbols
 # - Webhook mode for Render
 #
 # Env required:
@@ -97,11 +100,46 @@ OPTIONABLE_SYMBOLS: List[str] = [
     "KOTAKBANK", "DMART",
 ]
 
+# Used by autoscan (smaller core list)
 FUTURES_SCAN_LIST: List[str] = [
     "RELIANCE", "HDFCBANK", "ICICIBANK",
     "SBIN", "AXISBANK", "KOTAKBANK",
     "TCS", "INFY", "DMART",
     "NIFTY50", "BANKNIFTY",
+]
+
+# Most liquid NSE F&O futures symbols (for /futures)
+FUTURES_LIQUID_LIST: List[str] = [
+    # Index futures
+    "NIFTY50",
+    "BANKNIFTY",
+    "FINNIFTY",
+
+    # Large-cap F&O stocks (highly traded, curated)
+    "RELIANCE",
+    "HDFCBANK",
+    "ICICIBANK",
+    "SBIN",
+    "AXISBANK",
+    "KOTAKBANK",
+    "HDFC",
+    "TCS",
+    "INFY",
+    "LT",
+    "ITC",
+    "HINDUNILVR",
+    "BAJFINANCE",
+    "BAJAJFINSV",
+    "MARUTI",
+    "HCLTECH",
+    "ADANIENT",
+    "ADANIPORTS",
+    "TATASTEEL",
+    "TITAN",
+    "SUNPHARMA",
+    "ULTRACEMCO",
+    "NTPC",
+    "POWERGRID",
 ]
 
 # ============================================================
@@ -130,6 +168,24 @@ MULTI_TF_LIST: List[str] = ["5m", "15m", "30m", "1h", "2h", "4h", "1d", "3d", "1
 def map_symbol(raw: str) -> str:
     s = raw.strip().upper()
     return STOCK_SYMBOL_MAP.get(s, f"{s}.NS")
+
+
+def next_thursday_from(date: dt.date) -> dt.date:
+    d = date
+    while d.weekday() != 3:  # Thursday
+        d += dt.timedelta(days=1)
+    return d
+
+
+def last_thursday_of_month(year: int, month: int) -> dt.date:
+    if month == 12:
+        nxt = dt.date(year + 1, 1, 1)
+    else:
+        nxt = dt.date(year, month + 1, 1)
+    d = nxt - dt.timedelta(days=1)
+    while d.weekday() != 3:
+        d -= dt.timedelta(days=1)
+    return d
 
 
 # ============================================================
@@ -469,53 +525,15 @@ If highest probability >= 75%:
 
 
 # ============================================================
-# AI: OPTIONS ANALYSIS (SMART, STRIKE OPTIONAL)
+# AI: OPTIONS ANALYSIS (SMART, STRIKE OPTIONAL, NO DATES)
 # ============================================================
 
 async def ai_options_analysis(symbol: str, yf_symbol: str,
                               strike: Optional[float],
                               last_price: float) -> str:
-    today = dt.date.today()
-
-    # Prepare a few upcoming Thursdays for the model to choose
-    # (weekly expiries approximation)
-    next_thursdays = []
-    d = today
-    while len(next_thursdays) < 4:
-        if d.weekday() == 3:  # Thursday = 3
-            next_thursdays.append(d)
-        d += dt.timedelta(days=1)
-
-    # Monthly expiry approximation: last Thursday of current or next month
-    # (loose approx, still better than nothing)
-    def last_thursday_of_month(year, month):
-        # start from last day of month and go backwards
-        if month == 12:
-            nxt = dt.date(year + 1, 1, 1)
-        else:
-            nxt = dt.date(year, month + 1, 1)
-        last_day = nxt - dt.timedelta(days=1)
-        d2 = last_day
-        while d2.weekday() != 3:
-            d2 -= dt.timedelta(days=1)
-        return d2
-
-    monthly1 = last_thursday_of_month(today.year, today.month)
-    # if already past, go next month
-    if monthly1 < today:
-        m = today.month + 1
-        y = today.year
-        if m == 13:
-            m = 1
-            y += 1
-        monthly1 = last_thursday_of_month(y, m)
-
-    weekly_list = [d.strftime("%d %b %Y") for d in next_thursdays]
-    monthly_str = monthly1.strftime("%d %b %Y")
-
     user_strike_info = (
         f"User provided strike: {strike}" if strike is not None
-        else "User did not provide any strike; you must choose the safest strike."
+        else "User did not provide any strike; you must choose a safe strike."
     )
 
     prompt = f"""
@@ -524,12 +542,6 @@ You are an expert NSE options trader and risk manager.
 Underlying: {symbol} ({yf_symbol})
 Spot price: {last_price}
 {user_strike_info}
-
-Available nearby weekly expiry dates (Thursday):
-{weekly_list}
-
-Recommended monthly expiry candidate (approx last Thursday):
-{monthly_str}
 
 Your job:
 1. First decide the directional bias: bullish / bearish / flat.
@@ -540,16 +552,21 @@ Your job:
    - Sell Put (PE)
 
 3. Strike selection:
-   - If user strike is clearly reasonable, you MAY use it.
+   - If user strike is reasonable, you MAY use it.
    - But you are allowed to override and choose a BETTER strike
      (ATM or slightly OTM/ITM) if it is safer.
-   - Explain if you override the user strike.
+   - Explain briefly if you override the user strike.
 
-4. Expiry selection (SMART — option B):
-   - If trend is clean and strong → choose nearest WEEKLY expiry for aggressive directional trades.
-   - If current weekly expiry is too close (very little time left) or market is a bit choppy → choose NEXT weekly expiry.
-   - If market looks slow / range-bound but biased → choose MONTHLY expiry for safer theta/risk.
-   - Always mention the exact date (e.g. 09 Dec 2025) from the provided weekly/monthly list.
+4. Expiry selection (SMART - like "mode B"):
+   - You are NOT allowed to mention any calendar date.
+   - Instead, you must refer to:
+       * "nearest weekly expiry"
+       * "next weekly expiry"
+       * or "monthly expiry"
+   - Choose the safer one:
+       * clean strong trend → nearest weekly expiry
+       * close to current weekly expiry or choppy → next weekly expiry
+       * slow/range but biased → monthly expiry
 
 Return in MAX 8–10 lines:
 
@@ -558,15 +575,15 @@ Return in MAX 8–10 lines:
 3) Flat/choppy probability: Z %
 
 4) Suggested options action (risk-first):
-   - e.g. "Buy NIFTY50 22200 CE" OR "Sell RELIANCE 2600 PE"
+   - e.g. "Buy slightly OTM NIFTY50 CE" OR "Sell OTM RELIANCE PE"
    - clearly mention CE/PE and whether buy or sell.
-   - use ATM / slightly OTM strikes as appropriate.
+   - mention approximate relation of strike (ATM / slight OTM / slight ITM).
 
 5) Expiry:
-   - one of the provided weekly dates OR the monthly date.
-   - say: "Choose weekly expiry on <date>" OR "Choose monthly expiry on <date>"
+   - say ONLY: "nearest weekly expiry", or "next weekly expiry", or "monthly expiry"
+   - DO NOT mention any specific calendar date.
 
-6) Trade plan (for the underlying OR premium level):
+6) Trade plan (underlying or premium level):
    - Entry:
    - Stoploss:
    - Take profit:
@@ -574,8 +591,8 @@ Return in MAX 8–10 lines:
 
 7) Short explanation (2–3 lines) linking:
    - price action
-   - volume profile / key support-resistance zone
-   - why buy vs sell is safer in this scenario.
+   - volume profile / key support-resistance
+   - and why buy vs sell is safer in this scenario.
 """
 
     return await openrouter_chat(prompt)
@@ -687,14 +704,21 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — start autoscan (5m, medium frequency)\n"
         "/stop — stop autoscan\n"
         "/options — list optionable symbols\n"
-        "/strikeprice SYMBOL [STRIKE] — options AI analysis (strike is optional)\n"
+        "/futures — list highly liquid NSE F&O futures symbols\n"
+        "/strikeprice SYMBOL [STRIKE] — options AI analysis (strike optional)\n"
         "/dmart or /dmart 4h — multi-TF AI stock analysis\n"
     )
 
 
 async def cmd_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Optionable NSE symbols:\n" + ", ".join(OPTIONABLE_SYMBOLS)
+        "Optionable NSE symbols (examples):\n" + ", ".join(OPTIONABLE_SYMBOLS)
+    )
+
+
+async def cmd_futures(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Highly liquid NSE F&O futures symbols:\n" + ", ".join(FUTURES_LIQUID_LIST)
     )
 
 
@@ -781,7 +805,6 @@ async def cmd_strikeprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             strike = float(args[1])
         except ValueError:
-            # If user gave bad strike, just ignore and let AI choose
             strike = None
 
     yf_symbol = map_symbol(symbol)
@@ -793,8 +816,33 @@ async def cmd_strikeprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_price = float(df["close"].iloc[-1])
     await update.message.reply_text("📉 Analysing options via OpenRouter…")
 
-    text = await ai_options_analysis(symbol, yf_symbol, strike, last_price)
-    await update.message.reply_text(text)
+    ai_text = await ai_options_analysis(symbol, yf_symbol, strike, last_price)
+
+    # Compute expiry references on our side (avoid wrong dates from AI)
+    today = dt.date.today()
+    nearest_weekly = next_thursday_from(today)
+    next_weekly = next_thursday_from(nearest_weekly + dt.timedelta(days=1))
+
+    monthly = last_thursday_of_month(
+        nearest_weekly.year,
+        nearest_weekly.month,
+    )
+    if monthly < today:
+        m = monthly.month + 1
+        y = monthly.year
+        if m == 13:
+            m = 1
+            y += 1
+        monthly = last_thursday_of_month(y, m)
+
+    expiry_info = (
+        "\n\nExpiry reference (approx):\n"
+        f"- Nearest weekly expiry (Thursday): {nearest_weekly.strftime('%d %b %Y')}\n"
+        f"- Next weekly expiry (Thursday):    {next_weekly.strftime('%d %b %Y')}\n"
+        f"- Monthly expiry (approx last Thu): {monthly.strftime('%d %b %Y')}"
+    )
+
+    await update.message.reply_text(ai_text + expiry_info)
 
 
 async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -837,6 +885,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("options", cmd_options))
+    app.add_handler(CommandHandler("futures", cmd_futures))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("strikeprice", cmd_strikeprice))
@@ -857,3 +906,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
